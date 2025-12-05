@@ -1,26 +1,36 @@
 #!/bin/sh
 
-set -e
+set -eu
+
+AWS_PROFILE=""
+AWS_REGION="us-east-2"
+ENDPOINT_TYPE="reader"
+ENDPOINT_TYPE_EXPLICIT=false
+AUTH_TYPE=""
+ENVIRONMENT=""
+DB_USER=""
+DB_PASSWORD=""
+CONTAINER_NAME=""
 
 usage() {
   cat >&2 <<EOF
 Usage: $0 [OPTIONS]
 
 Required:
-  -e ENVIRONMENT    Environment tag value (test, staging, or prod)
+  -e ENVIRONMENT    Environment tag value
 
 Optional:
   -p PROFILE        AWS profile
   -r REGION         AWS region (default: us-east-2)
   -t ENDPOINT_TYPE  Endpoint type for Aurora (reader or writer, default: reader)
-  -a AUTH_TYPE      Authentication type (IAM, secrets-manager, or manual)
-  -u DB_USER        Database user (optional for manual auth, uses master user if omitted)
-  -w DB_PASSWORD    Database password (sets auth to manual if provided)
+  -a AUTH_TYPE      Authentication type (iam, secret, or manual)
+  -u DB_USER        Database user (optional for manual auth)
+  -w                Prompt for database password (sets auth to manual)
 
 Examples:
-  $0 -e prod -a IAM
+  $0 -e prod -a iam
   $0 -e staging -p myprofile -r us-west-2 -t writer
-  $0 -e test -u myuser -w mypassword
+  $0 -e test -u myuser -w
 EOF
   exit 1
 }
@@ -36,6 +46,37 @@ cleanup() {
   fi
 }
 
+read_password() {
+  printf "Enter database password: " >&2
+  stty -echo 2>/dev/null || true
+  read -r password_input </dev/tty
+  stty echo 2>/dev/null || true
+  echo "" >&2
+
+  [ -z "$password_input" ] && error_exit "Password cannot be empty"
+
+  DB_PASSWORD="$password_input"
+}
+
+parse_options() {
+  while getopts "p:r:t:a:e:u:wh" opt; do
+    case $opt in
+    p) AWS_PROFILE="$OPTARG" ;;
+    r) AWS_REGION="$OPTARG" ;;
+    t)
+      ENDPOINT_TYPE="$OPTARG"
+      ENDPOINT_TYPE_EXPLICIT=true
+      ;;
+    a) AUTH_TYPE="$OPTARG" ;;
+    e) ENVIRONMENT="$OPTARG" ;;
+    u) DB_USER="$OPTARG" ;;
+    w) read_password ;;
+    h) usage ;;
+    *) usage ;;
+    esac
+  done
+}
+
 validate_environment() {
   [ -z "$ENVIRONMENT" ] && error_exit "Environment parameter (-e) is required"
 
@@ -46,7 +87,7 @@ validate_environment() {
 }
 
 validate_endpoint_type() {
-  [ -z "$ENDPOINT_TYPE" ] && return
+  [ "$ENDPOINT_TYPE_EXPLICIT" = false ] && return 0
 
   case "$ENDPOINT_TYPE" in
   reader | writer) ;;
@@ -56,28 +97,34 @@ validate_endpoint_type() {
 
 validate_auth_parameters() {
   if [ -n "$DB_USER" ] && [ -z "$DB_PASSWORD" ]; then
-    error_exit "DB password (-w) must be provided with DB user (-u)"
+    error_exit "Password (-w) must be provided with database user (-u)"
   fi
 
   if [ -n "$DB_PASSWORD" ]; then
     if [ -n "$AUTH_TYPE" ] && [ "$AUTH_TYPE" != "manual" ]; then
-      error_exit "Cannot specify non-manual authentication type with DB password"
+      error_exit "Cannot specify non-manual authentication type with password"
     fi
     AUTH_TYPE="manual"
   fi
 
-  [ -z "$AUTH_TYPE" ] && return
+  [ -z "$AUTH_TYPE" ] && return 0
 
   case "$AUTH_TYPE" in
-  IAM | secrets-manager | manual) ;;
-  *) error_exit "Authentication type must be: IAM, secrets-manager, or manual" ;;
+  iam | secret | manual) ;;
+  *) error_exit "Authentication type must be: iam, secret, or manual" ;;
   esac
 }
 
+validate_all_parameters() {
+  validate_environment
+  validate_endpoint_type
+  validate_auth_parameters
+}
+
 check_dependencies() {
-  command -v aws >/dev/null 2>&1 || error_exit "AWS CLI is not installed"
-  command -v jq >/dev/null 2>&1 || error_exit "jq is not installed"
-  command -v docker >/dev/null 2>&1 || error_exit "Docker is not installed"
+  for tool in aws jq docker; do
+    command -v "$tool" >/dev/null 2>&1 || error_exit "'$tool' is required but not found"
+  done
 }
 
 build_aws_command() {
@@ -88,65 +135,100 @@ build_aws_command() {
   fi
 }
 
-find_rds_resources() {
+query_rds_instances() {
+  $AWS_CMD rds describe-db-instances 2>/dev/null || echo '{"DBInstances":[]}'
+}
+
+query_rds_clusters() {
+  $AWS_CMD rds describe-db-clusters 2>/dev/null || echo '{"DBClusters":[]}'
+}
+
+filter_by_environment() {
+  json_data="$1"
+  resource_type="$2"
+
+  echo "$json_data" | jq "[.$resource_type[] | select(.TagList[]? | select(.Key == \"Environment\" and .Value == \"$ENVIRONMENT\"))]"
+}
+
+filter_standalone_instances() {
+  instances="$1"
+  echo "$instances" | jq '[.[] | select(.DBClusterIdentifier == null or .DBClusterIdentifier == "")]'
+}
+
+count_resources() {
+  json_data="$1"
+  count=$(echo "$json_data" | jq 'length')
+  echo "${count:-0}"
+}
+
+query_and_filter_resources() {
   echo "Searching for RDS instances with Environment=$ENVIRONMENT..." >&2
 
-  INSTANCES=$($AWS_CMD rds describe-db-instances 2>/dev/null || echo '{"DBInstances":[]}')
-  INSTANCES=$(echo "$INSTANCES" | jq "[.DBInstances[] | select(.DBClusterIdentifier == null or .DBClusterIdentifier == \"\") | select(.TagList[]? | select(.Key == \"Environment\" and .Value == \"$ENVIRONMENT\"))]")
+  all_instances=$(query_rds_instances)
+  filtered_instances=$(filter_by_environment "$all_instances" "DBInstances")
+  INSTANCES=$(filter_standalone_instances "$filtered_instances")
 
-  CLUSTERS=$($AWS_CMD rds describe-db-clusters 2>/dev/null || echo '{"DBClusters":[]}')
-  CLUSTERS=$(echo "$CLUSTERS" | jq "[.DBClusters[] | select(.TagList[]? | select(.Key == \"Environment\" and .Value == \"$ENVIRONMENT\"))]")
+  all_clusters=$(query_rds_clusters)
+  CLUSTERS=$(filter_by_environment "$all_clusters" "DBClusters")
 
-  instance_count=$(echo "$INSTANCES" | jq 'length')
-  cluster_count=$(echo "$CLUSTERS" | jq 'length')
+  INSTANCE_COUNT=$(count_resources "$INSTANCES")
+  CLUSTER_COUNT=$(count_resources "$CLUSTERS")
+}
 
-  instance_count=${instance_count:-0}
-  cluster_count=${cluster_count:-0}
-  total_count=$((instance_count + cluster_count))
+validate_resource_count() {
+  total_count=$((INSTANCE_COUNT + CLUSTER_COUNT))
 
   if [ "$total_count" -eq 0 ]; then
     error_exit "No RDS instances or Aurora clusters found with Environment=$ENVIRONMENT"
   elif [ "$total_count" -gt 1 ]; then
     error_exit "Multiple RDS instances/clusters found with Environment=$ENVIRONMENT (found $total_count)"
   fi
-
-  INSTANCE_COUNT=$instance_count
-  CLUSTER_COUNT=$cluster_count
 }
 
 get_db_resource() {
+  field="$1"
   if [ "$IS_AURORA" = true ]; then
-    echo "$CLUSTERS" | jq -r ".[0]$1"
+    echo "$CLUSTERS" | jq -r ".[0]$field"
   else
-    echo "$INSTANCES" | jq -r ".[0]$1"
+    echo "$INSTANCES" | jq -r ".[0]$field"
   fi
 }
 
-extract_database_info() {
+extract_basic_info() {
   if [ "$INSTANCE_COUNT" -eq 1 ]; then
     IS_AURORA=false
-    ENDPOINT=$(get_db_resource '.Endpoint.Address')
-    PORT=$(get_db_resource '.Endpoint.Port')
     DB_INSTANCE_ID=$(get_db_resource '.DBInstanceIdentifier')
     DB_NAME=$(get_db_resource '.DBName // "postgres"')
-
-    [ "$ENDPOINT_TYPE" != "reader" ] && error_exit "Endpoint type parameter is only supported for Aurora clusters"
   else
     IS_AURORA=true
-    PORT=$(get_db_resource '.Port')
     DB_CLUSTER_ID=$(get_db_resource '.DBClusterIdentifier')
     DB_NAME=$(get_db_resource '.DatabaseName // "postgres"')
+  fi
 
+  PORT=$(get_db_resource '.Port // .Endpoint.Port')
+  ENGINE=$(get_db_resource '.Engine')
+  MASTER_USER=$(get_db_resource '.MasterUsername')
+  IAM_ENABLED=$(get_db_resource '.IAMDatabaseAuthenticationEnabled')
+}
+
+select_endpoint() {
+  if [ "$IS_AURORA" = false ]; then
+    if [ "$ENDPOINT_TYPE_EXPLICIT" = true ]; then
+      error_exit "Endpoint type parameter is only supported for Aurora clusters"
+    fi
+    ENDPOINT=$(get_db_resource '.Endpoint.Address')
+  else
     if [ "$ENDPOINT_TYPE" = "writer" ]; then
       ENDPOINT=$(get_db_resource '.Endpoint')
     else
       ENDPOINT=$(get_db_resource '.ReaderEndpoint // .Endpoint')
     fi
   fi
+}
 
-  ENGINE=$(get_db_resource '.Engine')
-  MASTER_USER=$(get_db_resource '.MasterUsername')
-  IAM_ENABLED=$(get_db_resource '.IAMDatabaseAuthenticationEnabled')
+extract_database_info() {
+  extract_basic_info
+  select_endpoint
 }
 
 determine_database_type() {
@@ -181,36 +263,51 @@ determine_database_type() {
   echo "Found $DB_TYPE database: $ENDPOINT:$PORT/$DB_NAME" >&2
 }
 
-get_secret_from_manager() {
-  secret_arn=$(get_db_resource '.MasterUserSecret.SecretArn // empty')
-
-  [ -z "$secret_arn" ] && return 1
-
-  secret_value=$($AWS_CMD secretsmanager get-secret-value \
+get_secret_value() {
+  secret_arn="$1"
+  $AWS_CMD secretsmanager get-secret-value \
     --secret-id "$secret_arn" \
     --query SecretString \
-    --output text) || return 1
+    --output text 2>/dev/null || echo ""
+}
 
-  FINAL_USER=$(echo "$secret_value" | jq -r '.username // empty') || return 1
-  FINAL_PASSWORD=$(echo "$secret_value" | jq -r '.password // empty') || return 1
+parse_secret_credentials() {
+  secret_value="$1"
+  username=$(echo "$secret_value" | jq -r '.username // empty' 2>/dev/null)
+  password=$(echo "$secret_value" | jq -r '.password // empty' 2>/dev/null)
 
-  [ -z "$FINAL_USER" ] || [ -z "$FINAL_PASSWORD" ] && return 1
+  [ -z "$username" ] || [ -z "$password" ] && return 1
+
+  FINAL_USER="$username"
+  FINAL_PASSWORD="$password"
   return 0
+}
+
+get_secret_from_manager() {
+  secret_arn=$(get_db_resource '.MasterUserSecret.SecretArn // empty')
+  [ -z "$secret_arn" ] && return 1
+
+  secret_value=$(get_secret_value "$secret_arn")
+  [ -z "$secret_value" ] && return 1
+
+  parse_secret_credentials "$secret_value"
 }
 
 authenticate_iam() {
   FINAL_USER="$MASTER_USER"
   SSL_REQUIRED=true
   echo "Generating IAM authentication token..." >&2
+
   FINAL_PASSWORD=$($AWS_CMD rds generate-db-auth-token \
     --hostname "$ENDPOINT" \
     --port "$PORT" \
     --username "$MASTER_USER" \
     --output text)
+
   echo "Using IAM authentication" >&2
 }
 
-authenticate_secrets_manager() {
+authenticate_secret() {
   echo "Retrieving credentials from AWS Secrets Manager..." >&2
 
   if ! get_secret_from_manager; then
@@ -240,26 +337,26 @@ authenticate_auto() {
     return
   fi
 
-  error_exit "No authentication method available. IAM is disabled and no Secrets Manager secret found. Use -a manual with -u and -w to provide credentials"
+  error_exit "No authentication method available. Use -a manual with -u and -w"
 }
 
 authenticate() {
   case "$AUTH_TYPE" in
   manual) authenticate_manual ;;
-  IAM) authenticate_iam ;;
-  secrets-manager) authenticate_secrets_manager ;;
+  iam) authenticate_iam ;;
+  secret) authenticate_secret ;;
   *) authenticate_auto ;;
   esac
 }
 
 build_docker_command() {
-  CONTAINER_NAME="dbclient-$(date +%s)-$$-$RANDOM"
+  CONTAINER_NAME="dbclient-$(date +%s)-$$"
   trap cleanup EXIT INT TERM
 
   docker_cmd="docker run --rm -it --name $CONTAINER_NAME"
 
   if [ -n "$PASSWORD_ENV" ]; then
-    docker_cmd="$docker_cmd -e $PASSWORD_ENV=$FINAL_PASSWORD"
+    docker_cmd="$docker_cmd -e $PASSWORD_ENV"
   fi
 
   docker_cmd="$docker_cmd $DOCKER_IMAGE"
@@ -269,10 +366,15 @@ build_docker_command() {
 
 connect_postgresql() {
   ssl_mode=""
-  [ "$SSL_REQUIRED" = true ] && ssl_mode="sslmode=require"
+  [ "$SSL_REQUIRED" = true ] && ssl_mode="?sslmode=require"
 
   docker_cmd=$(build_docker_command)
-  $docker_cmd psql "host=$ENDPOINT port=$PORT user=$FINAL_USER dbname=$DB_NAME password=$FINAL_PASSWORD $ssl_mode"
+
+  if [ -n "$PASSWORD_ENV" ]; then
+    PGPASSWORD="$FINAL_PASSWORD" $docker_cmd psql "postgresql://$FINAL_USER@$ENDPOINT:$PORT/$DB_NAME$ssl_mode"
+  else
+    $docker_cmd psql "postgresql://$FINAL_USER:$FINAL_PASSWORD@$ENDPOINT:$PORT/$DB_NAME$ssl_mode"
+  fi
 }
 
 connect_mysql() {
@@ -280,7 +382,12 @@ connect_mysql() {
   [ "$SSL_REQUIRED" = true ] && ssl_arg="--ssl-mode=REQUIRED"
 
   docker_cmd=$(build_docker_command)
-  $docker_cmd mysql -h "$ENDPOINT" -P "$PORT" -u "$FINAL_USER" -D "$DB_NAME" "$ssl_arg"
+
+  if [ -n "$PASSWORD_ENV" ]; then
+    MYSQL_PWD="$FINAL_PASSWORD" $docker_cmd mysql -h "$ENDPOINT" -P "$PORT" -u "$FINAL_USER" -D "$DB_NAME" $ssl_arg
+  else
+    $docker_cmd mysql -h "$ENDPOINT" -P "$PORT" -u "$FINAL_USER" -p"$FINAL_PASSWORD" -D "$DB_NAME" $ssl_arg
+  fi
 }
 
 connect_oracle() {
@@ -293,59 +400,33 @@ connect_sqlserver() {
   [ "$SSL_REQUIRED" = true ] && encrypt_arg="-N"
 
   docker_cmd=$(build_docker_command)
-  $docker_cmd sqlcmd -S "$ENDPOINT,$PORT" -U "$FINAL_USER" -P "$FINAL_PASSWORD" -d "$DB_NAME" "$encrypt_arg"
+  $docker_cmd sqlcmd -S "$ENDPOINT,$PORT" -U "$FINAL_USER" -P "$FINAL_PASSWORD" -d "$DB_NAME" $encrypt_arg
 }
 
 connect_to_database() {
   echo "Connecting to database as $FINAL_USER..." >&2
 
   case "$ENGINE" in
-  postgres | aurora-postgresql)
-    connect_postgresql
-    ;;
-  mysql | aurora-mysql | mariadb)
-    connect_mysql
-    ;;
-  oracle-ee | oracle-ee-cdb | oracle-se2 | oracle-se2-cdb)
-    connect_oracle
-    ;;
-  sqlserver-ee | sqlserver-se | sqlserver-ex | sqlserver-web)
-    connect_sqlserver
-    ;;
+  postgres | aurora-postgresql) connect_postgresql ;;
+  mysql | aurora-aurora-mysql | mariadb) connect_mysql ;;
+  oracle-ee | oracle-ee-cdb | oracle-se2 | oracle-se2-cdb) connect_oracle ;;
+  sqlserver-ee | sqlserver-se | sqlserver-ex | sqlserver-web) connect_sqlserver ;;
   esac
 
   exit $?
 }
 
-AWS_PROFILE=""
-AWS_REGION="us-east-2"
-ENDPOINT_TYPE="reader"
-AUTH_TYPE=""
-ENVIRONMENT=""
-DB_USER=""
-DB_PASSWORD=""
+main() {
+  parse_options "$@"
+  validate_all_parameters
+  check_dependencies
+  build_aws_command
+  query_and_filter_resources
+  validate_resource_count
+  extract_database_info
+  determine_database_type
+  authenticate
+  connect_to_database
+}
 
-while getopts "p:r:t:a:e:u:w:h" opt; do
-  case $opt in
-  p) AWS_PROFILE="$OPTARG" ;;
-  r) AWS_REGION="$OPTARG" ;;
-  t) ENDPOINT_TYPE="$OPTARG" ;;
-  a) AUTH_TYPE="$OPTARG" ;;
-  e) ENVIRONMENT="$OPTARG" ;;
-  u) DB_USER="$OPTARG" ;;
-  w) DB_PASSWORD="$OPTARG" ;;
-  h) usage ;;
-  *) usage ;;
-  esac
-done
-
-validate_environment
-validate_endpoint_type
-validate_auth_parameters
-check_dependencies
-build_aws_command
-find_rds_resources
-extract_database_info
-determine_database_type
-authenticate
-connect_to_database
+main "$@"
