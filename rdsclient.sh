@@ -7,7 +7,8 @@ AWS_REGION="us-east-2"
 ENDPOINT_TYPE="reader"
 ENDPOINT_TYPE_EXPLICIT=false
 AUTH_TYPE=""
-ENVIRONMENT=""
+TAG_KEY=""
+TAG_VALUE=""
 DB_USER=""
 DB_PASSWORD=""
 CONTAINER_NAME=""
@@ -17,20 +18,21 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Required:
-  -e ENVIRONMENT    Environment tag value
+  -t TAG_KEY        Tag key to filter databases
+  -v TAG_VALUE      Tag value to filter databases
 
 Optional:
   -p PROFILE        AWS profile
   -r REGION         AWS region (default: us-east-2)
-  -t ENDPOINT_TYPE  Endpoint type for Aurora (reader or writer, default: reader)
+  -e ENDPOINT_TYPE  Endpoint type for Aurora (reader or writer, default: reader)
   -a AUTH_TYPE      Authentication type (iam, secret, or manual)
   -u DB_USER        Database user (optional for manual auth)
   -w                Prompt for database password (sets auth to manual)
 
 Examples:
-  $0 -e prod -a iam
-  $0 -e staging -p myprofile -r us-west-2 -t writer
-  $0 -e test -u myuser -w
+  $0 -t Environment -v prod -a iam
+  $0 -t Environment -v staging -p myprofile -r us-west-2 -e writer
+  $0 -t Team -v backend -u myuser -w
 EOF
   exit 1
 }
@@ -59,16 +61,17 @@ read_password() {
 }
 
 parse_options() {
-  while getopts "p:r:t:a:e:u:wh" opt; do
+  while getopts "p:r:e:a:t:v:u:wh" opt; do
     case $opt in
     p) AWS_PROFILE="$OPTARG" ;;
     r) AWS_REGION="$OPTARG" ;;
-    t)
+    e)
       ENDPOINT_TYPE="$OPTARG"
       ENDPOINT_TYPE_EXPLICIT=true
       ;;
     a) AUTH_TYPE="$OPTARG" ;;
-    e) ENVIRONMENT="$OPTARG" ;;
+    t) TAG_KEY="$OPTARG" ;;
+    v) TAG_VALUE="$OPTARG" ;;
     u) DB_USER="$OPTARG" ;;
     w) read_password ;;
     h) usage ;;
@@ -77,13 +80,9 @@ parse_options() {
   done
 }
 
-validate_environment() {
-  [ -z "$ENVIRONMENT" ] && error_exit "Environment parameter (-e) is required"
-
-  case "$ENVIRONMENT" in
-  test | staging | prod) ;;
-  *) error_exit "Environment must be one of: test, staging, prod" ;;
-  esac
+validate_tag_parameters() {
+  [ -z "$TAG_KEY" ] && error_exit "Tag key parameter (-t) is required"
+  [ -z "$TAG_VALUE" ] && error_exit "Tag value parameter (-v) is required"
 }
 
 validate_endpoint_type() {
@@ -116,7 +115,7 @@ validate_auth_parameters() {
 }
 
 validate_all_parameters() {
-  validate_environment
+  validate_tag_parameters
   validate_endpoint_type
   validate_auth_parameters
 }
@@ -143,11 +142,11 @@ query_rds_clusters() {
   $AWS_CMD rds describe-db-clusters 2>/dev/null || echo '{"DBClusters":[]}'
 }
 
-filter_by_environment() {
+filter_by_tag() {
   json_data="$1"
   resource_type="$2"
 
-  echo "$json_data" | jq "[.$resource_type[] | select(.TagList[]? | select(.Key == \"Environment\" and .Value == \"$ENVIRONMENT\"))]"
+  echo "$json_data" | jq "[.$resource_type[] | select(.TagList[]? | select(.Key == \"$TAG_KEY\" and .Value == \"$TAG_VALUE\"))]"
 }
 
 filter_standalone_instances() {
@@ -162,14 +161,14 @@ count_resources() {
 }
 
 query_and_filter_resources() {
-  echo "Searching for RDS instances with Environment=$ENVIRONMENT..." >&2
+  echo "Searching for RDS instances with $TAG_KEY=$TAG_VALUE..." >&2
 
   all_instances=$(query_rds_instances)
-  filtered_instances=$(filter_by_environment "$all_instances" "DBInstances")
+  filtered_instances=$(filter_by_tag "$all_instances" "DBInstances")
   INSTANCES=$(filter_standalone_instances "$filtered_instances")
 
   all_clusters=$(query_rds_clusters)
-  CLUSTERS=$(filter_by_environment "$all_clusters" "DBClusters")
+  CLUSTERS=$(filter_by_tag "$all_clusters" "DBClusters")
 
   INSTANCE_COUNT=$(count_resources "$INSTANCES")
   CLUSTER_COUNT=$(count_resources "$CLUSTERS")
@@ -179,9 +178,9 @@ validate_resource_count() {
   total_count=$((INSTANCE_COUNT + CLUSTER_COUNT))
 
   if [ "$total_count" -eq 0 ]; then
-    error_exit "No RDS instances or Aurora clusters found with Environment=$ENVIRONMENT"
+    error_exit "No RDS instances or Aurora clusters found with $TAG_KEY=$TAG_VALUE"
   elif [ "$total_count" -gt 1 ]; then
-    error_exit "Multiple RDS instances/clusters found with Environment=$ENVIRONMENT (found $total_count)"
+    error_exit "Multiple RDS instances/clusters found with $TAG_KEY=$TAG_VALUE (found $total_count)"
   fi
 }
 

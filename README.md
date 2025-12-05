@@ -1,6 +1,6 @@
 # rdsclient.sh
 
-Connect to RDS instances and Aurora clusters by environment tag using appropriate database clients in Docker containers.
+Connect to RDS instances and Aurora clusters by tag key-value pair using appropriate database clients in Docker containers.
 
 ## Requirements
 
@@ -12,18 +12,19 @@ Connect to RDS instances and Aurora clusters by environment tag using appropriat
 ## Usage
 
 ```bash
-./rdsclient.sh -e <environment> [OPTIONS]
+./rdsclient.sh -t <tag-key> -v <tag-value> [OPTIONS]
 ```
 
 ### Required Parameters
 
-- `-e ENVIRONMENT` - Environment tag value (must be: test, staging, or prod)
+- `-t TAG_KEY` - Tag key to filter databases
+- `-v TAG_VALUE` - Tag value to filter databases
 
 ### Optional Parameters
 
 - `-p PROFILE` - AWS profile name
 - `-r REGION` - AWS region (default: us-east-2)
-- `-t ENDPOINT_TYPE` - Aurora endpoint type: `reader` or `writer` (default: reader, Aurora only)
+- `-e ENDPOINT_TYPE` - Aurora endpoint type: `reader` or `writer` (default: reader, Aurora only)
 - `-a AUTH_TYPE` - Authentication type: `iam`, `secret`, or `manual`
 - `-u DB_USER` - Database username (for manual authentication)
 - `-w` - Prompt for database password (sets authentication to manual)
@@ -38,19 +39,19 @@ Automatically selects authentication in this order:
 
 ### IAM Authentication
 ```bash
-./rdsclient.sh -e prod -a iam
+./rdsclient.sh -t Environment -v prod -a iam
 ```
 Requires IAM database authentication enabled on the database.
 
 ### Secrets Manager Authentication
 ```bash
-./rdsclient.sh -e staging -a secret
+./rdsclient.sh -t Environment -v staging -a secret
 ```
 Retrieves credentials from AWS Secrets Manager.
 
 ### Manual Authentication
 ```bash
-./rdsclient.sh -e test -u myuser -w
+./rdsclient.sh -t Team -v backend -u myuser -w
 ```
 Prompts for password securely (input not echoed to terminal).
 
@@ -63,29 +64,29 @@ Prompts for password securely (input not echoed to terminal).
 
 ## Examples
 
-Auto-detect authentication for production:
+Auto-detect authentication using Environment tag:
 ```bash
-./rdsclient.sh -e prod
+./rdsclient.sh -t Environment -v prod
 ```
 
 Connect to Aurora writer endpoint with specific profile:
 ```bash
-./rdsclient.sh -e staging -p myprofile -t writer
+./rdsclient.sh -t Environment -v staging -p myprofile -e writer
 ```
 
-Manual authentication with custom user:
+Manual authentication with custom user and tag:
 ```bash
-./rdsclient.sh -e test -u admin -w
+./rdsclient.sh -t Team -v backend -u admin -w
 ```
 
 Connect to different region:
 ```bash
-./rdsclient.sh -e prod -r us-west-2
+./rdsclient.sh -t Environment -v prod -r us-west-2
 ```
 
 ## Behavior
 
-- Finds exactly one RDS instance or Aurora cluster with matching Environment tag
+- Finds exactly one RDS instance or Aurora cluster with matching tag key-value pair
 - Errors if zero or multiple databases found
 - Endpoint type parameter only valid for Aurora clusters
 - Launches appropriate database client in Docker container
