@@ -12,7 +12,6 @@ DB_USER=""
 DB_PASSWORD=""
 CONTAINER_NAME=""
 SSL_MODE="true"
-TAB=$'\t'
 
 usage() {
   cat >&2 <<EOF
@@ -148,23 +147,30 @@ filter_by_tag() {
 get_standalone_instances() {
   instances_json="$1"
   echo "$instances_json" | jq '[.[] | select(.DBClusterIdentifier == null or .DBClusterIdentifier == "")] | sort_by(.DBInstanceIdentifier)' |
-    jq -r '.[] | [.DBInstanceIdentifier, .Engine, .Endpoint.Address, "rds", "n/a"] | @tsv'
+    jq -r '.[] | [.DBInstanceIdentifier, .Engine, .Endpoint.Address, "rds"] | @tsv'
 }
 
 get_cluster_endpoints() {
   clusters_json="$1"
   endpoint_type="$2"
 
-  case "$endpoint_type" in
-  writer)
-    echo "$clusters_json" | jq 'sort_by(.DBClusterIdentifier)' |
-      jq -r '.[] | [.DBClusterIdentifier, .Engine, .Endpoint, "aurora", "writer"] | @tsv'
-    ;;
-  reader)
-    echo "$clusters_json" | jq 'sort_by(.DBClusterIdentifier)' |
-      jq -r '.[] | select(.ReaderEndpoint != null) | [.DBClusterIdentifier, .Engine, .ReaderEndpoint, "aurora", "reader"] | @tsv'
-    ;;
-  esac
+  echo "$clusters_json" | jq -c 'sort_by(.DBClusterIdentifier) | .[]' | while read -r cluster; do
+    cluster_id=$(echo "$cluster" | jq -r '.DBClusterIdentifier')
+    engine=$(echo "$cluster" | jq -r '.Engine')
+    writer_endpoint=$(echo "$cluster" | jq -r '.Endpoint')
+    reader_endpoint=$(echo "$cluster" | jq -r '.ReaderEndpoint // empty')
+
+    if [ -z "$endpoint_type" ]; then
+      echo "$cluster_id$(printf '\t')$engine$(printf '\t')$writer_endpoint$(printf '\t')aurora"
+      if [ -n "$reader_endpoint" ]; then
+        echo "$cluster_id$(printf '\t')$engine$(printf '\t')$reader_endpoint$(printf '\t')aurora"
+      fi
+    elif [ "$endpoint_type" = "writer" ]; then
+      echo "$cluster_id$(printf '\t')$engine$(printf '\t')$writer_endpoint$(printf '\t')aurora"
+    elif [ "$endpoint_type" = "reader" ] && [ -n "$reader_endpoint" ]; then
+      echo "$cluster_id$(printf '\t')$engine$(printf '\t')$reader_endpoint$(printf '\t')aurora"
+    fi
+  done
 }
 
 assemble_database_list() {
@@ -173,14 +179,7 @@ assemble_database_list() {
   temp_file="$3"
 
   get_standalone_instances "$filtered_instances" >"$temp_file"
-
-  if [ -z "$ENDPOINT_TYPE" ] || [ "$ENDPOINT_TYPE" = "writer" ]; then
-    get_cluster_endpoints "$filtered_clusters" "writer" >>"$temp_file"
-  fi
-
-  if [ -z "$ENDPOINT_TYPE" ] || [ "$ENDPOINT_TYPE" = "reader" ]; then
-    get_cluster_endpoints "$filtered_clusters" "reader" >>"$temp_file"
-  fi
+  get_cluster_endpoints "$filtered_clusters" "$ENDPOINT_TYPE" >>"$temp_file"
 
   cat "$temp_file"
 }
@@ -216,10 +215,10 @@ query_databases() {
 display_databases() {
   echo "" >&2
   i=1
-  echo "$DATABASE_LIST" | while IFS="$(printf '\t')" read -r id engine endpoint type ep_type; do
+  echo "$DATABASE_LIST" | while IFS="$(printf '\t')" read -r id engine endpoint type; do
     if [ -n "$id" ]; then
       if [ "$type" = "aurora" ]; then
-        echo "$i. [Aurora-$ep_type] $id ($engine): $endpoint" >&2
+        echo "$i. [Aurora] $id ($engine): $endpoint" >&2
       else
         echo "$i. [RDS] $id ($engine): $endpoint" >&2
       fi
@@ -423,8 +422,6 @@ connect_database() {
   oracle-ee | oracle-ee-cdb | oracle-se2 | oracle-se2-cdb) connect_to_oracle ;;
   sqlserver-ee | sqlserver-se | sqlserver-ex | sqlserver-web) connect_to_sqlserver ;;
   esac
-
-  exit $?
 }
 
 main() {
