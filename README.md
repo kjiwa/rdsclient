@@ -9,12 +9,6 @@ Interactive AWS RDS and Aurora database connection tool with multiple authentica
 - jq (JSON processor)
 - Appropriate IAM permissions for RDS and Secrets Manager operations
 
-## Installation
-
-```bash
-chmod +x rdsclient.sh
-```
-
 ## Usage
 
 ```
@@ -113,18 +107,6 @@ Automatically selects authentication method:
 - MySQL / Aurora MySQL / MariaDB
 - Oracle (EE, SE2, CDB variants)
 - SQL Server (EE, SE, EX, Web)
-
-## Aurora Endpoints
-
-### Writer Endpoint
-- Read/write operations
-- Single instance endpoint
-- Primary cluster endpoint
-
-### Reader Endpoint
-- Read-only operations
-- Load-balanced across read replicas
-- Automatic failover capability
 
 ## Notes
 
