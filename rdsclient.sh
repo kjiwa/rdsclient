@@ -78,20 +78,24 @@ parse_options() {
   done
 }
 
-validate_parameters() {
+validate_tag() {
   if [ -n "$TAG_KEY" ] || [ -n "$TAG_VALUE" ]; then
     if [ -z "$TAG_KEY" ] || [ -z "$TAG_VALUE" ]; then
       error_exit "Both tag key (-t) and tag value (-v) must be provided together"
     fi
   fi
+}
 
+validate_endpoint_type() {
   if [ -n "$ENDPOINT_TYPE" ]; then
     case "$ENDPOINT_TYPE" in
     reader | writer) ;;
     *) error_exit "Endpoint type must be: reader or writer" ;;
     esac
   fi
+}
 
+validate_auth_type() {
   if [ -n "$DB_USER" ] || [ -n "$DB_PASSWORD" ]; then
     if [ -n "$AUTH_TYPE" ] && [ "$AUTH_TYPE" != "manual" ]; then
       error_exit "Cannot specify non-manual auth type with database user or password"
@@ -105,6 +109,12 @@ validate_parameters() {
     *) error_exit "Authentication type must be: iam, secret, or manual" ;;
     esac
   fi
+}
+
+validate_parameters() {
+  validate_tag
+  validate_endpoint_type
+  validate_auth_type
 }
 
 check_dependencies() {
@@ -229,14 +239,14 @@ get_database_details() {
   if [ "$DB_TYPE" = "aurora" ]; then
     details=$($AWS_CMD rds describe-db-clusters --db-cluster-identifier "$DB_IDENTIFIER" 2>/dev/null)
     PORT=$(echo "$details" | jq -r '.DBClusters[0].Port')
-    DB_NAME=$(echo "$details" | jq -r '.DBClusters[0].DatabaseName // "postgres"')
+    DB_NAME=$(echo "$details" | jq -r '.DBClusters[0].DatabaseName')
     MASTER_USER=$(echo "$details" | jq -r '.DBClusters[0].MasterUsername')
     IAM_ENABLED=$(echo "$details" | jq -r '.DBClusters[0].IAMDatabaseAuthenticationEnabled')
     SECRET_ARN=$(echo "$details" | jq -r '.DBClusters[0].MasterUserSecret.SecretArn // empty')
   else
     details=$($AWS_CMD rds describe-db-instances --db-instance-identifier "$DB_IDENTIFIER" 2>/dev/null)
     PORT=$(echo "$details" | jq -r '.DBInstances[0].Endpoint.Port')
-    DB_NAME=$(echo "$details" | jq -r '.DBInstances[0].DBName // "postgres"')
+    DB_NAME=$(echo "$details" | jq -r '.DBInstances[0].DBName')
     MASTER_USER=$(echo "$details" | jq -r '.DBInstances[0].MasterUsername')
     IAM_ENABLED=$(echo "$details" | jq -r '.DBInstances[0].IAMDatabaseAuthenticationEnabled')
     SECRET_ARN=$(echo "$details" | jq -r '.DBInstances[0].MasterUserSecret.SecretArn // empty')
@@ -275,50 +285,80 @@ determine_client() {
   esac
 }
 
+authenticate_manual() {
+  FINAL_USER="${DB_USER:-$MASTER_USER}"
+  FINAL_PASSWORD="$DB_PASSWORD"
+}
+
+authenticate_iam() {
+  echo "Generating IAM authentication token..." >&2
+
+  SSL_REQUIRED=true
+  FINAL_USER="$MASTER_USER"
+  FINAL_PASSWORD=$($AWS_CMD rds generate-db-auth-token \
+    --hostname "$ENDPOINT" \
+    --port "$PORT" \
+    --username "$MASTER_USER" \
+    --output text)
+}
+
+authenticate_secret() {
+  [ -z "$SECRET_ARN" ] && error_exit "No AWS Secrets Manager secret found for this database"
+
+  echo "Retrieving credentials from AWS Secrets Manager..." >&2
+  secret_value=$($AWS_CMD secretsmanager get-secret-value \
+    --secret-id "$SECRET_ARN" \
+    --query SecretString \
+    --output text 2>/dev/null)
+
+  SSL_REQUIRED=true
+  FINAL_USER=$(echo "$secret_value" | jq -r '.username // empty')
+  FINAL_PASSWORD=$(echo "$secret_value" | jq -r '.password // empty')
+  [ -z "$FINAL_USER" ] || [ -z "$FINAL_PASSWORD" ] && error_exit "Failed to parse credentials from Secrets Manager"
+}
+
+authenticate_auto() {
+  echo "Auto-detecting authentication method..." >&2
+  if [ "$IAM_ENABLED" = "true" ]; then
+    AUTH_TYPE="iam"
+  elif [ -n "$SECRET_ARN" ]; then
+    AUTH_TYPE="secret"
+  else
+    error_exit "No authentication method available. Use -a manual with -u and -w"
+  fi
+
+  authenticate
+}
+
 authenticate() {
   case "$AUTH_TYPE" in
-  manual)
-    FINAL_USER="${DB_USER:-$MASTER_USER}"
-    FINAL_PASSWORD="$DB_PASSWORD"
-    echo "Using manual authentication as $FINAL_USER" >&2
-    ;;
-  iam)
-    FINAL_USER="$MASTER_USER"
-    SSL_REQUIRED=true
-    echo "Generating IAM authentication token..." >&2
-    FINAL_PASSWORD=$($AWS_CMD rds generate-db-auth-token \
-      --hostname "$ENDPOINT" \
-      --port "$PORT" \
-      --username "$MASTER_USER" \
-      --output text)
-    echo "Using IAM authentication" >&2
-    ;;
-  secret)
-    [ -z "$SECRET_ARN" ] && error_exit "No AWS Secrets Manager secret found for this database"
-    echo "Retrieving credentials from AWS Secrets Manager..." >&2
-    secret_value=$($AWS_CMD secretsmanager get-secret-value \
-      --secret-id "$SECRET_ARN" \
-      --query SecretString \
-      --output text 2>/dev/null)
-    FINAL_USER=$(echo "$secret_value" | jq -r '.username // empty')
-    FINAL_PASSWORD=$(echo "$secret_value" | jq -r '.password // empty')
-    [ -z "$FINAL_USER" ] || [ -z "$FINAL_PASSWORD" ] && error_exit "Failed to parse credentials from Secrets Manager"
-    SSL_REQUIRED=true
-    echo "Using AWS Secrets Manager authentication" >&2
-    ;;
-  *)
-    echo "Auto-detecting authentication method..." >&2
-    if [ "$IAM_ENABLED" = "true" ]; then
-      AUTH_TYPE="iam"
-      authenticate
-    elif [ -n "$SECRET_ARN" ]; then
-      AUTH_TYPE="secret"
-      authenticate
-    else
-      error_exit "No authentication method available. Use -a manual with -u and -w"
-    fi
-    ;;
+  manual) authenticate_manual ;;
+  iam) authenticate_iam ;;
+  secret) authenticate_secret ;;
+  *) authenticate_auto ;;
   esac
+}
+
+connect_to_postgresql() {
+  ssl_mode=""
+  [ "$SSL_REQUIRED" = true ] && ssl_mode="?sslmode=require"
+  PGPASSWORD="$FINAL_PASSWORD" $docker_cmd psql "postgresql://$FINAL_USER@$ENDPOINT:$PORT/$DB_NAME$ssl_mode"
+}
+
+connect_to_mysql() {
+  ssl_arg=""
+  [ "$SSL_REQUIRED" = true ] && ssl_arg="--ssl-mode=REQUIRED"
+  MYSQL_PWD="$FINAL_PASSWORD" $docker_cmd mysql -h "$ENDPOINT" -P "$PORT" -u "$FINAL_USER" -D "$DB_NAME" $ssl_arg
+}
+
+connect_to_oracle() {
+  $docker_cmd sqlplus "$FINAL_USER/$FINAL_PASSWORD@//$ENDPOINT:$PORT/$DB_NAME"
+}
+
+connect_to_sqlserver() {
+  encrypt_arg=""
+  [ "$SSL_REQUIRED" = true ] && encrypt_arg="-N"
+  $docker_cmd sqlcmd -S "$ENDPOINT,$PORT" -U "$FINAL_USER" -P "$FINAL_PASSWORD" -d "$DB_NAME" $encrypt_arg
 }
 
 connect_database() {
@@ -334,32 +374,10 @@ connect_database() {
   docker_cmd="$docker_cmd $DOCKER_IMAGE"
 
   case "$ENGINE" in
-  postgres | aurora-postgresql)
-    ssl_mode=""
-    [ "$SSL_REQUIRED" = true ] && ssl_mode="?sslmode=require"
-    if [ -n "$PASSWORD_ENV" ]; then
-      PGPASSWORD="$FINAL_PASSWORD" $docker_cmd psql "postgresql://$FINAL_USER@$ENDPOINT:$PORT/$DB_NAME$ssl_mode"
-    else
-      $docker_cmd psql "postgresql://$FINAL_USER:$FINAL_PASSWORD@$ENDPOINT:$PORT/$DB_NAME$ssl_mode"
-    fi
-    ;;
-  mysql | aurora-mysql | mariadb)
-    ssl_arg=""
-    [ "$SSL_REQUIRED" = true ] && ssl_arg="--ssl-mode=REQUIRED"
-    if [ -n "$PASSWORD_ENV" ]; then
-      MYSQL_PWD="$FINAL_PASSWORD" $docker_cmd mysql -h "$ENDPOINT" -P "$PORT" -u "$FINAL_USER" -D "$DB_NAME" $ssl_arg
-    else
-      $docker_cmd mysql -h "$ENDPOINT" -P "$PORT" -u "$FINAL_USER" -p"$FINAL_PASSWORD" -D "$DB_NAME" $ssl_arg
-    fi
-    ;;
-  oracle-ee | oracle-ee-cdb | oracle-se2 | oracle-se2-cdb)
-    $docker_cmd sqlplus "$FINAL_USER/$FINAL_PASSWORD@//$ENDPOINT:$PORT/$DB_NAME"
-    ;;
-  sqlserver-ee | sqlserver-se | sqlserver-ex | sqlserver-web)
-    encrypt_arg=""
-    [ "$SSL_REQUIRED" = true ] && encrypt_arg="-N"
-    $docker_cmd sqlcmd -S "$ENDPOINT,$PORT" -U "$FINAL_USER" -P "$FINAL_PASSWORD" -d "$DB_NAME" $encrypt_arg
-    ;;
+  postgres | aurora-postgresql) connect_to_postgresql ;;
+  mysql | aurora-mysql | mariadb) connect_to_mysql ;;
+  oracle-ee | oracle-ee-cdb | oracle-se2 | oracle-se2-cdb) connect_to_oracle ;;
+  sqlserver-ee | sqlserver-se | sqlserver-ex | sqlserver-web) connect_to_sqlserver ;;
   esac
 
   exit $?
