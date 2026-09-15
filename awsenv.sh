@@ -259,11 +259,18 @@ create_dockerfile() {
   _dockerfile_cmd="yum install -y unzip"
   [ -n "$_dockerfile_pkgs" ] && _dockerfile_cmd="$_dockerfile_cmd $_dockerfile_pkgs"
 
+  # session-manager-plugin ships separate x86_64 and arm64 RPMs; detect the
+  # image's own architecture at build time rather than the host's, since a
+  # buildx --platform build can target an architecture the host doesn't have.
   cat <<EOF
 FROM $BASE_IMAGE
 RUN $_dockerfile_cmd && \\
+    case "\$(uname -m)" in \\
+    aarch64 | arm64) _smp_arch=linux_arm64 ;; \\
+    *) _smp_arch=linux_64bit ;; \\
+    esac && \\
     curl -sSL -o /tmp/session-manager-plugin.rpm \\
-    https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm && \\
+    "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/\${_smp_arch}/session-manager-plugin.rpm" && \\
     yum install -y /tmp/session-manager-plugin.rpm && \\
     rm -f /tmp/session-manager-plugin.rpm && \\
     yum clean all
