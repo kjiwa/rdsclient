@@ -1,0 +1,8 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # kjiwa/.github is an own-account reusable workflow; a `@main` ref
+        # pin is trusted here and its SHA is expected to move.
+        kjiwa/.github/*: ref-pin
+        "*": hash-pin
