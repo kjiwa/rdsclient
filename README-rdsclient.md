@@ -8,6 +8,7 @@ This is the complete reference; for the overview, quick start, and installation,
 
 - Multiple tag-based filtering with AND logic
 - Auto-connects with single match
+- Non-interactive selection (`-i`) and one-shot SQL (`-c`)
 - Auto-detection of authentication methods
 - Standalone RDS instances, Aurora clusters (reader/writer endpoints), and Multi-AZ DB clusters
 - Multiple authentication types
@@ -43,8 +44,10 @@ rdsclient.sh [OPTIONS]
 
 Options:
   -t TAG=VALUE      Tag filter (can be specified multiple times for AND logic)
+  -i INDEX|ID       Select database by 1-based list index or identifier
   -e ENDPOINT_TYPE  Aurora/cluster endpoint: reader or writer
   -a AUTH_TYPE      Authentication: iam, secret, or manual
+  -c SQL            Run SQL non-interactively and exit (not supported for Oracle)
   -u DB_USER        Database user (sets auth to manual unless -a is also given)
   -s SSL_MODE       Use SSL: true or false (default: true)
   -h                Show help
@@ -58,6 +61,8 @@ Examples:
   rdsclient.sh -t Environment=prod
   rdsclient.sh -t Environment=prod -t Application=api -a iam
   rdsclient.sh -t Environment=staging -e writer
+  rdsclient.sh -t Environment=prod -i my-database
+  rdsclient.sh -t Environment=prod -i 1 -a iam -c "select now()"
   rdsclient.sh -u myuser -a manual
   rdsclient.sh -t Environment=dev -s false
 ```
@@ -98,6 +103,24 @@ Profile and region come entirely from the AWS CLI's own resolution: `AWS_PROFILE
 
 * Uses an **interactive password prompt**.
 * Password is **not stored or logged**.
+
+## Non-interactive use
+
+`-i INDEX|ID` skips the picker. A number selects by the 1-based menu position; anything else is an exact match on the database identifier. An out-of-range index or unknown identifier is an error.
+
+`-c SQL` runs the statement without a TTY and exits: `psql -c`, `mysql -e`, or `sqlcmd -b -Q`. The SQL is passed as one argument. Oracle is rejected.
+
+```bash
+# Select by identifier
+./rdsclient.sh -t Environment=prod -i my-database
+
+# Select by menu position and run a statement
+./rdsclient.sh -t Environment=prod -i 1 -a iam -c "select now()"
+```
+
+`-c` is fully non-interactive with `-a iam` or `-a secret`; manual authentication still prompts for the password on the terminal.
+
+An Aurora cluster identifier matches its writer line first. Add `-e reader` to select the reader endpoint.
 
 ## Tag Filtering
 

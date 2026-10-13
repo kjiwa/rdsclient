@@ -33,6 +33,8 @@ TAG_COUNT=0
 SELECTED_ID=""
 SELECTED_IP=""
 SSM_COMMAND="sh"
+SSM_COMMAND_GIVEN=0
+SELECTOR=""
 
 usage() {
   _usage_exit_code="${1:-1}"
@@ -42,10 +44,13 @@ Usage: $0 [OPTIONS]
 
 Optional:
   -t TAG=VALUE      Tag filter (can be specified multiple times for AND logic)
+  -i INDEX|ID       Select instance by 1-based list index or instance ID
   -c METHOD         Connection method (ssh or ssm, default: ssm)
   -u USER           SSH user (default: ec2-user)
   -k KEYFILE        SSH private key file path
-  -s COMMAND        SSM command to execute (default: sh)
+  -s COMMAND        SSM command to execute (default: sh). When stdin is not a
+                    terminal, runs COMMAND as root via SSM send-command, prints
+                    its output, and exits with its status
   -h                Show this help message
 
 Environment Variables:
@@ -64,6 +69,7 @@ Examples:
   $0
   $0 -t Environment=prod
   $0 -t Environment=prod -t Team=backend
+  $0 -t Environment=prod -i i-0123456789abcdef0
   $0 -t Name=bastion -c ssh -k ~/.ssh/mykey.pem
   $0 -t Environment=staging -s "cd; bash -l"
 EOF
@@ -160,7 +166,7 @@ get_tag_at_index() {
 # --- END SHARED: get_tag_at_index ---
 
 parse_options() {
-  while getopts "t:c:u:k:s:h" _parse_opt; do
+  while getopts "t:i:c:u:k:s:h" _parse_opt; do
     case "$_parse_opt" in
     t)
       parse_tag_argument "$OPTARG"
@@ -168,10 +174,17 @@ parse_options() {
       reject_comma_in_tag_value "$PARSED_VALUE"
       accumulate_tags "$PARSED_KEY" "$PARSED_VALUE"
       ;;
+    i)
+      [ -n "$OPTARG" ] || error_exit "Selector cannot be empty"
+      SELECTOR="$OPTARG"
+      ;;
     c) CONNECT_METHOD="$OPTARG" ;;
     u) SSH_USER="$OPTARG" ;;
     k) SSH_KEY_FILE="$OPTARG" ;;
-    s) SSM_COMMAND="$OPTARG" ;;
+    s)
+      SSM_COMMAND="$OPTARG"
+      SSM_COMMAND_GIVEN=1
+      ;;
     h) usage 0 ;;
     *) usage ;;
     esac
@@ -205,10 +218,27 @@ validate_ssh_user() {
   esac
 }
 
+validate_selector() {
+  [ -n "$SELECTOR" ] || return 0
+  printf "%s" "$SELECTOR" | grep -Eq '^([0-9]+|i-[0-9a-f]+)$' ||
+    error_exit "Selector must be a list index or an instance ID (i-...): $SELECTOR"
+}
+
+validate_ssm_command() {
+  [ "$SSM_COMMAND_GIVEN" -eq 0 ] || [ "$CONNECT_METHOD" = "ssm" ] ||
+    error_exit "-s applies only to -c ssm"
+}
+
 validate_parameters() {
+  validate_selector
   validate_connect_method
+  validate_ssm_command
   validate_ssh_key_file
   validate_ssh_user
+}
+
+runs_as_command() {
+  [ "$SSM_COMMAND_GIVEN" -eq 1 ] && [ ! -t 0 ]
 }
 
 check_dependencies() {
@@ -216,7 +246,7 @@ check_dependencies() {
     command -v "$_check_tool" >/dev/null 2>&1 || error_exit "'$_check_tool' is required but not found"
   done
 
-  if [ "$CONNECT_METHOD" = "ssm" ]; then
+  if [ "$CONNECT_METHOD" = "ssm" ] && ! runs_as_command; then
     command -v session-manager-plugin >/dev/null 2>&1 || error_exit "'session-manager-plugin' is required but not found"
   fi
 
@@ -343,6 +373,30 @@ read_user_selection() {
 }
 # --- END SHARED: read_user_selection ---
 
+# --- BEGIN SHARED: resolve_selection ---
+resolve_selection() {
+  _rs_ids="$1"
+  _rs_count="$2"
+  _rs_selector="$3"
+  _rs_noun="$4"
+
+  case "$_rs_selector" in
+  *[!0-9]*)
+    _rs_line=$(printf "%s\n" "$_rs_ids" | grep -n -x -F -- "$_rs_selector" | head -n 1 | cut -d: -f1)
+    [ -n "$_rs_line" ] || error_exit "$_rs_noun '$_rs_selector' not found"
+    printf "%s" "$_rs_line"
+    return 0
+    ;;
+  esac
+
+  if [ "$_rs_selector" -lt 1 ] || [ "$_rs_selector" -gt "$_rs_count" ]; then
+    error_exit "$_rs_noun index $_rs_selector out of range (1-$_rs_count)"
+  fi
+
+  printf "%s" "$_rs_selector"
+}
+# --- END SHARED: resolve_selection ---
+
 select_instance() {
   _select_inst_list="$1"
   _select_inst_ids=$(parse_instance_list "$_select_inst_list")
@@ -350,7 +404,9 @@ select_instance() {
 
   [ "$_select_inst_count" -eq 0 ] && error_exit "No instances found"
 
-  if [ "$_select_inst_count" -eq 1 ]; then
+  if [ -n "$SELECTOR" ]; then
+    _select_inst_choice=$(resolve_selection "$_select_inst_ids" "$_select_inst_count" "$SELECTOR" "instance")
+  elif [ "$_select_inst_count" -eq 1 ]; then
     printf "Connecting to instance...\n" >&2
     _select_inst_choice=1
   else
@@ -389,6 +445,51 @@ connect_ssm() {
     --parameters "$_connect_ssm_cmd_json"
 }
 
+report_command_failure() {
+  _rcf_id="$1"
+  _rcf_status="$2"
+
+  case "$_rcf_status" in
+  Pending | InProgress | Delayed)
+    error_exit "Command $_rcf_id still $_rcf_status after waiting; check: aws ssm get-command-invocation --command-id $_rcf_id --instance-id $SELECTED_ID"
+    ;;
+  esac
+  error_exit "Command $_rcf_id ended with status $_rcf_status"
+}
+
+run_ssm_command() {
+  printf "Running command on %s via SSM...\n" "$SELECTED_ID" >&2
+  _rsc_parameters=$(jq -nc --arg cmd "$SSM_COMMAND" '{"commands":[$cmd]}')
+
+  _rsc_command_id=$(AWSENV_TTY=never aws ssm send-command \
+    --instance-ids "$SELECTED_ID" \
+    --document-name "AWS-RunShellScript" \
+    --parameters "$_rsc_parameters" \
+    --query "Command.CommandId" \
+    --output text) || error_exit "Failed to send command to $SELECTED_ID"
+
+  # Exits non-zero for any terminal status other than Success; the invocation
+  # fetched below carries the real status and output.
+  AWSENV_TTY=never aws ssm wait command-executed \
+    --command-id "$_rsc_command_id" \
+    --instance-id "$SELECTED_ID" || true
+
+  _rsc_result=$(AWSENV_TTY=never aws ssm get-command-invocation \
+    --command-id "$_rsc_command_id" \
+    --instance-id "$SELECTED_ID" \
+    --output json) || error_exit "Failed to fetch result of command $_rsc_command_id"
+
+  printf "%s" "$_rsc_result" | jq -j '.StandardOutputContent'
+  printf "%s" "$_rsc_result" | jq -j '.StandardErrorContent' >&2
+
+  _rsc_status=$(printf "%s" "$_rsc_result" | jq -r '.Status')
+  _rsc_code=$(printf "%s" "$_rsc_result" | jq -r '.ResponseCode // -1')
+  if [ "$_rsc_status" != "Success" ] && [ "$_rsc_code" -le 0 ]; then
+    report_command_failure "$_rsc_command_id" "$_rsc_status"
+  fi
+  exit "$_rsc_code"
+}
+
 connect() {
   case "$CONNECT_METHOD" in
   ssh) connect_ssh ;;
@@ -404,6 +505,9 @@ main() {
 
   _main_inst_data=$(query_instances)
   select_instance "$_main_inst_data"
+  if runs_as_command; then
+    run_ssm_command
+  fi
   connect
 }
 
