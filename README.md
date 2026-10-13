@@ -28,6 +28,7 @@ With a single match it connects immediately — no prompt.
 ## Features
 
 - Tag-based discovery with AND logic (`-t Environment=prod -t Application=api`)
+- Non-interactive use: `-i` selects a database by index or identifier, `-c SQL` runs one statement and exits
 - Authentication auto-detection: IAM → Secrets Manager → interactive password prompt
 - Standalone RDS instances, Aurora clusters (reader/writer endpoints), and Multi-AZ DB clusters
 - Database clients run in Docker — nothing to install locally
@@ -72,8 +73,10 @@ rdsclient [OPTIONS]
 
 Options:
   -t TAG=VALUE      Tag filter (repeatable, AND logic)
+  -i INDEX|ID       Select database by 1-based list index or identifier
   -e ENDPOINT_TYPE  Aurora/cluster endpoint: reader or writer
   -a AUTH_TYPE      Authentication: iam, secret, or manual
+  -c SQL            Run SQL non-interactively and exit (not supported for Oracle)
   -u DB_USER        Database user (sets auth to manual unless -a is also given)
   -s SSL_MODE       Use SSL: true or false (default: true)
   -h                Show help
@@ -83,6 +86,7 @@ Examples:
   rdsclient -t Environment=prod
   rdsclient -t Environment=prod -t Application=api -a iam
   rdsclient -t Environment=staging -e writer
+  rdsclient -t Environment=prod -i 1 -a iam -c "select now()"
   rdsclient -u myuser -a manual
 ```
 
@@ -102,7 +106,7 @@ Full details — `-u` semantics, per-engine `DatabaseName` defaults, Oracle pass
 Two companion tools live in this repo, sharing the same design: single POSIX script, tag-based UX, stub-tested.
 
 - **[awsenv](README-awsenv.md)** — run the AWS CLI (and your own scripts) in Docker with credentials, SSO, TTY handling, and package installation managed for you. Installing its wrapper scripts (`aws`, `aws_completer`, `session-manager-plugin`) makes Docker the only thing rdsclient needs on the host.
-- **[ec2client](README-ec2client.md)** — connect to EC2 instances via SSM or SSH with the same `-t Tag=Value` filtering and interactive picker as rdsclient.
+- **[ec2client](README-ec2client.md)** — connect to EC2 instances via SSM or SSH with the same `-t Tag=Value` filtering and interactive picker as rdsclient, plus `-i` selection and remote commands without a terminal.
 
 ## Installation Details
 

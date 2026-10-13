@@ -33,6 +33,8 @@ DB_USER=""
 DB_PASSWORD=""
 CONTAINER_NAME=""
 SSL_MODE="true"
+SELECTOR=""
+SQL_COMMAND=""
 
 usage() {
   _usage_exit_code="${1:-1}"
@@ -42,8 +44,10 @@ Usage: $0 [OPTIONS]
 
 Optional:
   -t TAG=VALUE      Tag filter (can be specified multiple times for AND logic)
+  -i INDEX|ID       Select database by 1-based list index or identifier
   -e ENDPOINT_TYPE  Aurora/cluster endpoint type (reader or writer)
   -a AUTH_TYPE      Authentication type (iam, secret, or manual)
+  -c SQL            Run SQL non-interactively and exit (not supported for Oracle)
   -u DB_USER        Database user (sets auth to manual unless -a is also given)
   -s SSL_MODE       Use SSL connection (true or false, default: true)
   -h                Show this help message
@@ -65,6 +69,8 @@ Examples:
   $0 -t Environment=prod
   $0 -t Environment=prod -t Application=api -a iam
   $0 -t Environment=staging -e writer
+  $0 -t Environment=prod -i my-database
+  $0 -t Environment=prod -i 1 -a iam -c "select now()"
   $0 -u myuser -a manual
   $0 -t Environment=dev -s false
 EOF
@@ -171,7 +177,7 @@ get_tag_at_index() {
 # --- END SHARED: get_tag_at_index ---
 
 parse_options() {
-  while getopts "e:a:t:u:s:h" _parse_opt; do
+  while getopts "e:a:t:i:c:u:s:h" _parse_opt; do
     case "$_parse_opt" in
     e) ENDPOINT_TYPE="$OPTARG" ;;
     a) AUTH_TYPE="$OPTARG" ;;
@@ -179,6 +185,14 @@ parse_options() {
       parse_tag_argument "$OPTARG"
       validate_tag_format "$OPTARG" "$PARSED_KEY" "$PARSED_VALUE"
       accumulate_tags "$PARSED_KEY" "$PARSED_VALUE"
+      ;;
+    i)
+      [ -n "$OPTARG" ] || error_exit "Selector cannot be empty"
+      SELECTOR="$OPTARG"
+      ;;
+    c)
+      [ -n "$OPTARG" ] || error_exit "SQL command cannot be empty"
+      SQL_COMMAND="$OPTARG"
       ;;
     u) DB_USER="$OPTARG" ;;
     s) SSL_MODE="$OPTARG" ;;
@@ -222,7 +236,14 @@ validate_ssl_mode() {
   esac
 }
 
+validate_selector() {
+  [ -n "$SELECTOR" ] || return 0
+  printf "%s" "$SELECTOR" | grep -Eq '^([0-9]+|[A-Za-z][A-Za-z0-9-]*)$' ||
+    error_exit "Selector must be a list index or a database identifier: $SELECTOR"
+}
+
 validate_parameters() {
+  validate_selector
   validate_endpoint_type
   validate_auth_type
   validate_ssl_mode
@@ -416,10 +437,37 @@ read_user_selection() {
 }
 # --- END SHARED: read_user_selection ---
 
+# --- BEGIN SHARED: resolve_selection ---
+resolve_selection() {
+  _rs_ids="$1"
+  _rs_count="$2"
+  _rs_selector="$3"
+  _rs_noun="$4"
+
+  case "$_rs_selector" in
+  *[!0-9]*)
+    _rs_line=$(printf "%s\n" "$_rs_ids" | grep -n -x -F -- "$_rs_selector" | head -n 1 | cut -d: -f1)
+    [ -n "$_rs_line" ] || error_exit "$_rs_noun '$_rs_selector' not found"
+    printf "%s" "$_rs_line"
+    return 0
+    ;;
+  esac
+
+  if [ "$_rs_selector" -lt 1 ] || [ "$_rs_selector" -gt "$_rs_count" ]; then
+    error_exit "$_rs_noun index $_rs_selector out of range (1-$_rs_count)"
+  fi
+
+  printf "%s" "$_rs_selector"
+}
+# --- END SHARED: resolve_selection ---
+
 select_database() {
   _select_db_count=$(count_lines "$DATABASE_LIST")
 
-  if [ "$_select_db_count" -eq 1 ]; then
+  if [ -n "$SELECTOR" ]; then
+    _select_db_ids=$(printf "%s\n" "$DATABASE_LIST" | cut -f1)
+    _select_db_choice=$(resolve_selection "$_select_db_ids" "$_select_db_count" "$SELECTOR" "database")
+  elif [ "$_select_db_count" -eq 1 ]; then
     printf "Connecting to database...\n" >&2
     _select_db_choice=1
   else
@@ -472,6 +520,7 @@ determine_client() {
     DOCKER_IMAGE="container-registry.oracle.com/database/instantclient:latest"
     PASSWORD_ENV=""
     CLIENT="sqlplus"
+    [ -z "$SQL_COMMAND" ] || error_exit "-c is not supported for Oracle (sqlplus prompts for the password)"
     ;;
   sqlserver-ee | sqlserver-se | sqlserver-ex | sqlserver-web)
     DOCKER_IMAGE="mcr.microsoft.com/mssql-tools18/mssql-tools"
@@ -546,21 +595,36 @@ authenticate() {
   esac
 }
 
+run_client() {
+  if [ -n "$SQL_COMMAND" ]; then
+    docker run --rm --name "$CONTAINER_NAME" "$@"
+  else
+    docker run --rm -it --name "$CONTAINER_NAME" "$@"
+  fi
+}
+
 connect_to_postgresql() {
   _pg_db_name="${DB_NAME:-postgres}"
   _pg_url="postgresql://$FINAL_USER@$ENDPOINT:$PORT/$_pg_db_name"
   [ "$SSL_MODE" = "true" ] && _pg_url="$_pg_url?sslmode=require"
 
-  docker run --rm -it --name "$CONTAINER_NAME" -e "$PASSWORD_ENV" "$DOCKER_IMAGE" \
-    psql "$_pg_url"
+  set -- psql
+  if [ -n "$SQL_COMMAND" ]; then
+    set -- "$@" -c "$SQL_COMMAND"
+  fi
+
+  run_client -e "$PASSWORD_ENV" "$DOCKER_IMAGE" "$@" "$_pg_url"
 }
 
 connect_to_mysql() {
   set -- mysql -h "$ENDPOINT" -P "$PORT" -u "$FINAL_USER"
   [ -n "$DB_NAME" ] && set -- "$@" -D "$DB_NAME"
   [ "$SSL_MODE" = "true" ] && set -- "$@" --ssl-mode=REQUIRED
+  if [ -n "$SQL_COMMAND" ]; then
+    set -- "$@" -e "$SQL_COMMAND"
+  fi
 
-  docker run --rm -it --name "$CONTAINER_NAME" -e "$PASSWORD_ENV" "$DOCKER_IMAGE" "$@"
+  run_client -e "$PASSWORD_ENV" "$DOCKER_IMAGE" "$@"
 }
 
 connect_to_oracle() {
@@ -569,7 +633,7 @@ connect_to_oracle() {
   [ -z "$DB_NAME" ] && error_exit "Failed to retrieve Oracle service name (DatabaseName). Oracle requires it to connect"
 
   printf "sqlplus will prompt for the password interactively.\n" >&2
-  docker run --rm -it --name "$CONTAINER_NAME" "$DOCKER_IMAGE" \
+  run_client "$DOCKER_IMAGE" \
     sqlplus "$FINAL_USER@//$ENDPOINT:$PORT/$DB_NAME"
 }
 
@@ -586,7 +650,11 @@ connect_to_sqlserver() {
     set -- "$@" -N o -C
   fi
 
-  docker run --rm -it --name "$CONTAINER_NAME" -e "$PASSWORD_ENV" "$DOCKER_IMAGE" "$@"
+  if [ -n "$SQL_COMMAND" ]; then
+    set -- "$@" -b -Q "$SQL_COMMAND"
+  fi
+
+  run_client -e "$PASSWORD_ENV" "$DOCKER_IMAGE" "$@"
 }
 
 connect_database() {

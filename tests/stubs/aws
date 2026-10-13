@@ -10,6 +10,9 @@
 #   FIXTURE_EC2_INSTANCES  Path to a describe-instances TSV fixture
 #   FIXTURE_IAM_TOKEN      Literal string returned for generate-db-auth-token
 #   FIXTURE_SECRET_STRING  Literal string returned for secretsmanager get-secret-value
+#   FIXTURE_SSM_COMMAND_ID Literal command ID returned for ssm send-command (default: cmd-0stub)
+#   FIXTURE_SSM_INVOCATION Literal JSON returned for ssm get-command-invocation
+#                          (default: Success, ResponseCode 0, empty output)
 #   STUB_AWS_EXIT          If set, forces this exit status (simulates a CLI failure)
 
 set -eu
@@ -58,6 +61,15 @@ secretsmanager.get-secret-value)
   else
     printf '%s' '{"username":"secretuser","password":"secretpass"}'
   fi
+  ;;
+ssm.send-command)
+  printf "%s" "${FIXTURE_SSM_COMMAND_ID:-cmd-0stub}"
+  ;;
+ssm.wait)
+  ;;
+ssm.get-command-invocation)
+  default_invocation='{"Status":"Success","ResponseCode":0,"StandardOutputContent":"","StandardErrorContent":""}'
+  printf '%s' "${FIXTURE_SSM_INVOCATION:-$default_invocation}"
   ;;
 ssm.start-session)
   printf "stub ssm session started\n"

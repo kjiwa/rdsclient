@@ -9,6 +9,7 @@ Connect to EC2 instances via SSH or SSM. Filter by tags, select interactively, a
 - SSH and SSM connection methods
 - Works with private instances (SSM)
 - Custom SSM commands
+- Non-interactive selection (`-i`) and remote commands without a terminal
 
 ## Prerequisites
 
@@ -18,6 +19,7 @@ Connect to EC2 instances via SSH or SSM. Filter by tags, select interactively, a
 - **AWS credentials** with appropriate permissions
   - `ec2:DescribeInstances` for querying instances
   - `ssm:StartSession` for SSM connections
+  - `ssm:SendCommand` and `ssm:GetCommandInvocation` for non-interactive use
 
 ## Usage
 
@@ -26,10 +28,13 @@ ec2client.sh [OPTIONS]
 
 Options:
   -t TAG=VALUE      Tag filter (can be specified multiple times for AND logic)
+  -i INDEX|ID       Select instance by 1-based list index or instance ID
   -c METHOD         Connection method: ssh or ssm (default: ssm)
   -u USER           SSH user (default: ec2-user)
   -k KEYFILE        SSH private key path
-  -s COMMAND        SSM command (default: sh)
+  -s COMMAND        SSM command (default: sh). When stdin is not a
+                    terminal, runs COMMAND as root via SSM send-command, prints
+                    its output, and exits with its status
   -h                Show help
 
 Environment Variables:
@@ -40,6 +45,7 @@ Examples:
   ec2client.sh
   ec2client.sh -t Environment=prod
   ec2client.sh -t Environment=prod -t Team=backend
+  ec2client.sh -t Environment=prod -i i-0123456789abcdef0
   ec2client.sh -t Name=bastion -c ssh -k ~/.ssh/key.pem
   ec2client.sh -t Environment=staging -s "cd; bash -l"
 ```
@@ -63,6 +69,25 @@ Profile and region come entirely from the AWS CLI's own resolution: `AWS_PROFILE
 * Requires the instance to have a **public IP address** or reachable private IP (via VPN, for example).
 * Requires a **security group rule allowing inbound traffic on TCP Port 22**.
 * Supports **agent forwarding** (using the `-A` flag).
+
+## Non-interactive use
+
+`-i INDEX|ID` skips the picker. A number selects by the 1-based menu position; anything else is an exact match on the instance ID. An out-of-range index or unknown ID is an error.
+
+When `-s` is given and stdin is not a terminal, ec2client does not start a session. It runs COMMAND with `ssm send-command` and the `AWS-RunShellScript` document, prints stdout and stderr, and exits with the remote command's exit status. This mode needs only `aws` and `jq` locally; `session-manager-plugin` is not used. `-s` is rejected with `-c ssh`.
+
+```bash
+# Run a command on a selected instance
+./ec2client.sh -t Name=web -i 1 -s "df -h" </dev/null
+
+# Select by instance ID
+./ec2client.sh -t Environment=prod -i i-0123456789abcdef0 -s "uptime" </dev/null
+```
+
+Notes:
+- The command runs as root, not `ssm-user`: the SSM Agent runs as root. Any principal allowed to send `AWS-RunShellScript` has root on the instance.
+- ec2client waits with `aws ssm wait command-executed`, which polls every 5 seconds for up to 20 checks (about 100 seconds). If the command is still running, ec2client reports its status and prints the `aws ssm get-command-invocation` command to check later.
+- `GetCommandInvocation` returns only the first 24,000 characters of stdout and 8,000 of stderr.
 
 ## Tag Filtering
 
